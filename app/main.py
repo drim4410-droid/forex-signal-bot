@@ -1,6 +1,8 @@
 import asyncio
 import os
+
 from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
@@ -8,7 +10,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_TG_ID", "0"))
 
-from aiogram.enums import ParseMode
 bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
@@ -152,7 +153,10 @@ async def make_draft(m: Message):
     kb.button(text="🗑 Отменить", callback_data=f"cancel:{draft_id}")
     kb.adjust(1)
 
-    await m.answer("🧾 <b>Черновик сигнала</b>\n\n" + format_signal(parts), reply_markup=kb.as_markup())
+    await m.answer(
+        "🧾 <b>Черновик сигнала</b>\n\n" + format_signal(parts),
+        reply_markup=kb.as_markup(),
+    )
 
 
 @dp.callback_query(F.data.startswith("cancel:"))
