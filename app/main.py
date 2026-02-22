@@ -2,6 +2,7 @@ import asyncio
 import os
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
@@ -10,7 +11,21 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_TG_ID", "0"))
 
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+# Текст/ссылка для оплаты (можно настроить в Railway Variables)
+PAY_TEXT = os.getenv(
+    "PAY_TEXT",
+    "💳 <b>Оплата</b>\n\n"
+    "Чтобы оплатить доступ/подписку — напишите мне:\n"
+    "👉 <b>@YOUR_USERNAME</b>\n\n"
+    "Или оплатите по ссылке:\n"
+    "👉 <b>PAY_LINK</b>\n"
+)
+PAY_URL = os.getenv("PAY_URL", "").strip()  # если хочешь кнопку со ссылкой
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
 
 # tg_id -> сколько бесплатных сигналов осталось
@@ -29,10 +44,20 @@ def main_keyboard(is_admin_user: bool):
     kb = ReplyKeyboardBuilder()
     kb.button(text="📊 Статус")
     kb.button(text="ℹ️ Помощь")
+    kb.button(text="💳 Оплата")
     if is_admin_user:
         kb.button(text="📝 Новый сигнал (админ)")
     kb.adjust(2)
     return kb.as_markup(resize_keyboard=True)
+
+
+def pay_keyboard():
+    kb = InlineKeyboardBuilder()
+    if PAY_URL:
+        kb.button(text="💳 Оплатить (ссылка)", url=PAY_URL)
+    kb.button(text="✉️ Написать админу", callback_data="pay:contact")
+    kb.adjust(1)
+    return kb.as_markup()
 
 
 def format_signal(parts: list[str]) -> str:
@@ -85,6 +110,11 @@ async def status_cmd(m: Message):
     )
 
 
+@dp.message(Command("pay"))
+async def pay_cmd(m: Message):
+    await m.answer(PAY_TEXT, reply_markup=pay_keyboard())
+
+
 @dp.message(Command("newsignal"))
 async def newsignal_cmd(m: Message):
     if not is_admin(m.from_user.id):
@@ -109,9 +139,13 @@ async def status_btn(m: Message):
 async def help_btn(m: Message):
     msg = (
         "ℹ️ <b>Помощь</b>\n\n"
+        "Кнопки:\n"
+        "• 📊 Статус — остаток бесплатных сигналов\n"
+        "• 💳 Оплата — связь для оплаты\n\n"
         "Команды:\n"
         "• /start — запустить бота\n"
-        "• /status — остаток бесплатных сигналов\n\n"
+        "• /status — статус\n"
+        "• /pay — оплата\n\n"
         "Для админа:\n"
         "• /newsignal — инструкция создания сигнала\n"
         "• или кнопка <b>Новый сигнал (админ)</b>\n\n"
@@ -122,9 +156,20 @@ async def help_btn(m: Message):
     await m.answer(msg, reply_markup=main_keyboard(is_admin(m.from_user.id)))
 
 
+@dp.message(F.text == "💳 Оплата")
+async def pay_btn(m: Message):
+    await pay_cmd(m)
+
+
 @dp.message(F.text == "📝 Новый сигнал (админ)")
 async def newsignal_btn(m: Message):
     await newsignal_cmd(m)
+
+
+@dp.callback_query(F.data == "pay:contact")
+async def pay_contact(cb: CallbackQuery):
+    # Просто подтверждение/подсказка. Текст и ссылки — в PAY_TEXT/PAY_URL.
+    await cb.answer("Напишите админу по контактам в сообщении 👆", show_alert=True)
 
 
 # ===== СОЗДАНИЕ ЧЕРНОВИКА (админ) =====
@@ -194,6 +239,7 @@ async def approve(cb: CallbackQuery):
             users[uid] -= 1
             sent += 1
         except Exception:
+            # если пользователь заблокировал бота и т.п.
             pass
 
     drafts.pop(did, None)
