@@ -1,23 +1,21 @@
 import os
 import asyncio
-import logging
-import sqlite3
+import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Dict, List, Optional, Tuple
 
-import aiohttp
+import httpx
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardRemove,
+)
 
-
-# ----------------------------
-# ENV
-# ----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "").strip()
 
@@ -26,198 +24,123 @@ if not BOT_TOKEN:
 if not TWELVE_API_KEY:
     raise RuntimeError("TWELVE_API_KEY is not set")
 
-
-# ----------------------------
-# LOGGING
-# ----------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("signal_bot")
-
-
-# ----------------------------
-# SETTINGS
-# ----------------------------
-DB_PATH = os.getenv("DB_PATH", "app/data.db")
-
-# Пары, которые бот будет анализировать (можешь оставить только нужные)
-# TwelveData чаще принимает форекс как "EUR/USD", золото как "XAU/USD"
+# Какие рынки анализируем (можешь менять)
 SYMBOLS = ["EUR/USD", "XAU/USD"]
+INTERVAL = "5min"
+LOOKBACK = 150  # свечей для индикаторов
+PRICE_POLL_SECONDS = 10  # как часто проверять цену для TP/SL
 
-TIMEFRAME = "5min"
-CANDLES_LIMIT = 120  # достаточно для EMA/RSI/ATR
-
-# Индикаторы
-EMA_FAST = 9
-EMA_SLOW = 21
-RSI_LEN = 14
-ATR_LEN = 14
-
-# Мультипликаторы риск/профит
-SL_ATR_MULT = 1.0
-TP_ATR_MULT = 1.5
-
-# Как часто проверять цену для закрытия сигнала
-PRICE_CHECK_SECONDS = 30
-
-
-# ----------------------------
-# DB
-# ----------------------------
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
-
-
-def init_db() -> None:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    with db() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS active_signals (
-                user_id INTEGER PRIMARY KEY,
-                symbol TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                timeframe TEXT NOT NULL,
-                entry REAL NOT NULL,
-                tp REAL NOT NULL,
-                sl REAL NOT NULL,
-                note TEXT,
-                opened_at TEXT NOT NULL
-            )
-            """
-        )
-        conn.commit()
+# Порог, чтобы не давать сигнал в “пилу”
+MIN_ATR_REL = 0.00005  # для FX ~0.005% (для золота будет норм из-за цены)
 
 
 @dataclass
 class Signal:
-    user_id: int
     symbol: str
+    interval: str
     direction: str  # BUY/SELL
-    timeframe: str
     entry: float
     tp: float
     sl: float
     note: str
-    opened_at: str  # ISO
+    created_at: float
 
 
-def get_active_signal(user_id: int) -> Optional[Signal]:
-    with db() as conn:
-        row = conn.execute(
-            "SELECT user_id, symbol, direction, timeframe, entry, tp, sl, COALESCE(note,''), opened_at "
-            "FROM active_signals WHERE user_id=?",
-            (user_id,),
-        ).fetchone()
-    if not row:
-        return None
-    return Signal(*row)
+# Активные сигналы по пользователям
+active_signal_by_user: Dict[int, Signal] = {}
+# Фоновая задача отслеживания по пользователям
+watch_task_by_user: Dict[int, asyncio.Task] = {}
 
 
-def set_active_signal(s: Signal) -> None:
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO active_signals (user_id, symbol, direction, timeframe, entry, tp, sl, note, opened_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                symbol=excluded.symbol,
-                direction=excluded.direction,
-                timeframe=excluded.timeframe,
-                entry=excluded.entry,
-                tp=excluded.tp,
-                sl=excluded.sl,
-                note=excluded.note,
-                opened_at=excluded.opened_at
-            """,
-            (s.user_id, s.symbol, s.direction, s.timeframe, s.entry, s.tp, s.sl, s.note, s.opened_at),
-        )
-        conn.commit()
+def main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📌 Новый сигнал", callback_data="new_signal"),
+                InlineKeyboardButton(text="ℹ️ Помощь", callback_data="help"),
+            ]
+        ]
+    )
 
 
-def clear_active_signal(user_id: int) -> None:
-    with db() as conn:
-        conn.execute("DELETE FROM active_signals WHERE user_id=?", (user_id,))
-        conn.commit()
+HELP_TEXT = (
+    "<b>Как пользоваться ботом</b>\n\n"
+    "1) Нажми <b>📌 Новый сигнал</b> — бот попробует найти сигнал.\n"
+    "2) Если сигнал найден, бот сам будет отслеживать цену.\n"
+    "3) Новый сигнал появится только после закрытия предыдущего (TP или SL).\n\n"
+    "<b>Важно</b>: сигналы не являются финансовой рекомендацией."
+)
 
 
-def list_all_active_signals() -> List[Signal]:
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT user_id, symbol, direction, timeframe, entry, tp, sl, COALESCE(note,''), opened_at FROM active_signals"
-        ).fetchall()
-    return [Signal(*r) for r in rows]
+# -------------------- Индикаторы --------------------
 
-
-# ----------------------------
-# INDICATORS
-# ----------------------------
 def ema(values: List[float], period: int) -> List[float]:
     if len(values) < period:
         return []
     k = 2 / (period + 1)
     out = []
-    prev = sum(values[:period]) / period
-    out.extend([None] * (period - 1))
-    out.append(prev)
+    ema_prev = sum(values[:period]) / period
+    out.append(ema_prev)
     for v in values[period:]:
-        prev = v * k + prev * (1 - k)
-        out.append(prev)
-    return out
+        ema_prev = v * k + ema_prev * (1 - k)
+        out.append(ema_prev)
+    # выравниваем длину под values: первые period-1 значений нет
+    return [None] * (period - 1) + out  # type: ignore
 
 
-def rsi(values: List[float], period: int) -> List[float]:
+def rsi(values: List[float], period: int = 14) -> List[float]:
     if len(values) < period + 1:
         return []
     gains = []
     losses = []
     for i in range(1, len(values)):
-        diff = values[i] - values[i - 1]
-        gains.append(max(diff, 0.0))
-        losses.append(max(-diff, 0.0))
+        ch = values[i] - values[i - 1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
 
-    out = [None] * period
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
+    out = [None] * period  # type: ignore
 
-    rs = (avg_gain / avg_loss) if avg_loss != 0 else float("inf")
-    out.append(100 - (100 / (1 + rs)))
+    def calc(g, l):
+        if l == 0:
+            return 100.0
+        rs = g / l
+        return 100 - (100 / (1 + rs))
 
+    out.append(calc(avg_gain, avg_loss))
     for i in range(period, len(gains)):
         avg_gain = (avg_gain * (period - 1) + gains[i]) / period
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        rs = (avg_gain / avg_loss) if avg_loss != 0 else float("inf")
-        out.append(100 - (100 / (1 + rs)))
+        out.append(calc(avg_gain, avg_loss))
     return out
 
 
-def atr(highs: List[float], lows: List[float], closes: List[float], period: int) -> List[float]:
+def atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> List[float]:
     if len(closes) < period + 1:
         return []
-    trs = []
+    tr = []
     for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]),
-        )
-        trs.append(tr)
+        tr1 = highs[i] - lows[i]
+        tr2 = abs(highs[i] - closes[i - 1])
+        tr3 = abs(lows[i] - closes[i - 1])
+        tr.append(max(tr1, tr2, tr3))
 
-    out = [None] * period
-    prev = sum(trs[:period]) / period
-    out.append(prev)
-    for tr in trs[period:]:
-        prev = (prev * (period - 1) + tr) / period
+    # Wilder smoothing
+    atr0 = sum(tr[:period]) / period
+    out = [None] * period  # type: ignore
+    out.append(atr0)
+    prev = atr0
+    for i in range(period, len(tr)):
+        prev = (prev * (period - 1) + tr[i]) / period
         out.append(prev)
     return out
 
 
-# ----------------------------
-# TWELVE DATA API
-# ----------------------------
-async def td_time_series(session: aiohttp.ClientSession, symbol: str, interval: str, outputsize: int) -> Dict[str, Any]:
-    # https://twelvedata.com/docs#time-series
+# -------------------- TwelveData API --------------------
+
+async def td_time_series(symbol: str, interval: str, outputsize: int) -> Tuple[List[float], List[float], List[float], List[float]]:
+    url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol,
         "interval": interval,
@@ -225,149 +148,207 @@ async def td_time_series(session: aiohttp.ClientSession, symbol: str, interval: 
         "apikey": TWELVE_API_KEY,
         "format": "JSON",
     }
-    async with session.get("https://api.twelvedata.com/time_series", params=params, timeout=20) as resp:
-        data = await resp.json()
-        return data
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, params=params)
+        data = r.json()
+
+    if "status" in data and data["status"] == "error":
+        raise RuntimeError(data.get("message", "TwelveData error"))
+
+    values = data.get("values") or []
+    if not values:
+        raise RuntimeError("No candle data returned")
+
+    # values идут от новых к старым → переворачиваем
+    values = list(reversed(values))
+
+    opens = [float(x["open"]) for x in values]
+    highs = [float(x["high"]) for x in values]
+    lows = [float(x["low"]) for x in values]
+    closes = [float(x["close"]) for x in values]
+    return opens, highs, lows, closes
 
 
-async def td_price(session: aiohttp.ClientSession, symbol: str) -> Optional[float]:
-    # https://twelvedata.com/docs#price
+async def td_quote(symbol: str) -> float:
+    url = "https://api.twelvedata.com/quote"
     params = {"symbol": symbol, "apikey": TWELVE_API_KEY, "format": "JSON"}
-    async with session.get("https://api.twelvedata.com/price", params=params, timeout=20) as resp:
-        data = await resp.json()
-        if isinstance(data, dict) and "price" in data:
-            try:
-                return float(data["price"])
-            except Exception:
-                return None
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, params=params)
+        data = r.json()
+
+    if "status" in data and data["status"] == "error":
+        raise RuntimeError(data.get("message", "TwelveData error"))
+
+    # price как строка
+    p = data.get("price")
+    if p is None:
+        raise RuntimeError("No price in quote")
+    return float(p)
+
+
+# -------------------- Логика сигналов --------------------
+
+def pick_best_signal(symbol: str, interval: str, highs: List[float], lows: List[float], closes: List[float]) -> Optional[Signal]:
+    # Индикаторы
+    e9 = ema(closes, 9)
+    e21 = ema(closes, 21)
+    r14 = rsi(closes, 14)
+    a14 = atr(highs, lows, closes, 14)
+
+    if not e9 or not e21 or not r14 or not a14:
         return None
 
-
-def parse_candles(td_data: Dict[str, Any]) -> Tuple[List[float], List[float], List[float]]:
-    # TwelveData returns "values" as list of dicts, newest first
-    if "values" not in td_data or not isinstance(td_data["values"], list):
-        raise ValueError(f"TwelveData error: {td_data}")
-
-    values = td_data["values"][::-1]  # oldest -> newest
-    closes, highs, lows = [], [], []
-    for v in values:
-        closes.append(float(v["close"]))
-        highs.append(float(v["high"]))
-        lows.append(float(v["low"]))
-    return closes, highs, lows
-
-
-# ----------------------------
-# SIGNAL ENGINE (простая, но адекватная логика)
-# ----------------------------
-def build_signal(symbol: str, closes: List[float], highs: List[float], lows: List[float]) -> Optional[Tuple[str, float, float, float, str]]:
-    """
-    Возвращает (direction, entry, tp, sl, note) или None если условий нет.
-    Логика:
-      - тренд: EMA(9) vs EMA(21)
-      - фильтр: RSI не перегрет (для BUY < 70, для SELL > 30)
-      - SL/TP от ATR
-    """
-    if len(closes) < max(EMA_SLOW, RSI_LEN + 1, ATR_LEN + 1) + 5:
+    i = len(closes) - 1
+    if e9[i] is None or e21[i] is None or r14[i] is None or a14[i] is None:
         return None
 
-    ema_fast = ema(closes, EMA_FAST)
-    ema_slow = ema(closes, EMA_SLOW)
-    rsi_v = rsi(closes, RSI_LEN)
-    atr_v = atr(highs, lows, closes, ATR_LEN)
+    close = closes[i]
+    ema9 = float(e9[i])
+    ema21 = float(e21[i])
+    rsi14 = float(r14[i])
+    atr14 = float(a14[i])
 
-    if not ema_fast or not ema_slow or not rsi_v or not atr_v:
+    # Фильтр: слишком маленькая волатильность → не даём сигнал
+    if atr14 / max(close, 1e-9) < MIN_ATR_REL:
         return None
 
-    last_close = closes[-1]
-    ef = ema_fast[-1]
-    es = ema_slow[-1]
-    rv = rsi_v[-1]
-    av = atr_v[-1]
-
-    if ef is None or es is None or rv is None or av is None:
-        return None
-
-    # Тренд + фильтр по RSI
+    # Условия (простые, но не “рандом”):
+    # BUY: EMA9 > EMA21 и RSI 50..65
+    # SELL: EMA9 < EMA21 и RSI 35..50
     direction = None
-    if ef > es and rv < 70:
+    if ema9 > ema21 and 50.0 <= rsi14 <= 65.0:
         direction = "BUY"
-    elif ef < es and rv > 30:
+    elif ema9 < ema21 and 35.0 <= rsi14 <= 50.0:
         direction = "SELL"
     else:
         return None
 
-    entry = last_close
+    # TP/SL по ATR
+    # Риск/прибыль ~1:1.6
+    sl_dist = 1.0 * atr14
+    tp_dist = 1.6 * atr14
+
+    entry = close  # берем последнюю цену закрытия как entry
     if direction == "BUY":
-        sl = entry - (SL_ATR_MULT * av)
-        tp = entry + (TP_ATR_MULT * av)
+        sl = entry - sl_dist
+        tp = entry + tp_dist
     else:
-        sl = entry + (SL_ATR_MULT * av)
-        tp = entry - (TP_ATR_MULT * av)
+        sl = entry + sl_dist
+        tp = entry - tp_dist
 
-    note = f"EMA{EMA_FAST}>{EMA_SLOW if direction=='BUY' else ''}{''} | RSI={rv:.1f} | ATR={av:.5f}"
-    return direction, entry, tp, sl, note
+    note = f"EMA9 vs EMA21 | RSI={rsi14:.1f} | ATR={atr14:.5f}"
+
+    return Signal(
+        symbol=symbol,
+        interval=interval,
+        direction=direction,
+        entry=round(entry, 5),
+        tp=round(tp, 5),
+        sl=round(sl, 5),
+        note=note,
+        created_at=time.time(),
+    )
 
 
-def fmt_price(x: float, symbol: str) -> str:
-    # форекс обычно 5 знаков, золото 2
-    if "XAU" in symbol:
-        return f"{x:.2f}"
-    return f"{x:.5f}"
+async def generate_signal() -> Optional[Signal]:
+    # Пробуем по всем символам — найдём “самый адекватный” по ATR (больше движение = легче отработка)
+    candidates: List[Signal] = []
+
+    for sym in SYMBOLS:
+        try:
+            _, highs, lows, closes = await td_time_series(sym, INTERVAL, LOOKBACK)
+            sig = pick_best_signal(sym, INTERVAL, highs, lows, closes)
+            if sig:
+                # чем больше ATR относительно цены — тем интереснее (условно)
+                atr_rel = abs(sig.tp - sig.entry) / max(sig.entry, 1e-9)
+                candidates.append((atr_rel, sig))  # type: ignore
+        except Exception:
+            continue
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
 
 
-def signal_text(s: Signal) -> str:
-    dir_emoji = "🟢 BUY" if s.direction == "BUY" else "🔴 SELL"
+def format_signal(sig: Signal) -> str:
+    emoji = "🟢 BUY" if sig.direction == "BUY" else "🔴 SELL"
     return (
-        f"📊 <b>{s.symbol} SIGNAL</b> <i>({s.timeframe})</i>\n\n"
-        f"<b>Direction:</b> {dir_emoji}\n"
-        f"<b>Entry:</b> <code>{fmt_price(s.entry, s.symbol)}</code>\n"
-        f"<b>Take Profit:</b> <code>{fmt_price(s.tp, s.symbol)}</code>\n"
-        f"<b>Stop Loss:</b> <code>{fmt_price(s.sl, s.symbol)}</code>\n\n"
-        f"<b>Note:</b> {s.note}\n\n"
+        f"✅ <b>Сигнал найден.</b> Отслеживаю TP/SL автоматически.\n\n"
+        f"📊 <b>{sig.symbol} SIGNAL</b> <i>({sig.interval})</i>\n\n"
+        f"<b>Direction:</b> {emoji}\n"
+        f"<b>Entry:</b> <code>{sig.entry}</code>\n"
+        f"<b>Take Profit:</b> <code>{sig.tp}</code>\n"
+        f"<b>Stop Loss:</b> <code>{sig.sl}</code>\n\n"
+        f"<b>Note:</b> {sig.note}\n\n"
         f"⚠️ <i>Не является финансовой рекомендацией.</i>"
     )
 
 
-def help_text() -> str:
-    return (
-        "ℹ️ <b>Как пользоваться ботом</b>\n\n"
-        "1) Нажми <b>Новый сигнал</b> — бот попробует найти сетап по рынку.\n"
-        "2) Пока сигнал активен, новый не выдаётся.\n"
-        "3) Бот сам отслеживает цену и закроет сигнал, когда будет достигнут <b>TP</b> или <b>SL</b>.\n\n"
-        "⚠️ Важно: это экспериментальная аналитика, не гарантия прибыли."
-    )
+async def watch_tp_sl(bot: Bot, user_id: int, sig: Signal):
+    try:
+        while True:
+            await asyncio.sleep(PRICE_POLL_SECONDS)
+            price = await td_quote(sig.symbol)
+
+            hit_tp = False
+            hit_sl = False
+
+            if sig.direction == "BUY":
+                hit_tp = price >= sig.tp
+                hit_sl = price <= sig.sl
+            else:
+                hit_tp = price <= sig.tp
+                hit_sl = price >= sig.sl
+
+            if hit_tp or hit_sl:
+                result = "🎯 <b>TP достигнут</b> ✅" if hit_tp else "🛑 <b>SL достигнут</b> ❌"
+                await bot.send_message(
+                    user_id,
+                    f"{result}\n\n"
+                    f"<b>{sig.symbol}</b> ({sig.interval})\n"
+                    f"<b>Direction:</b> {sig.direction}\n"
+                    f"<b>Entry:</b> <code>{sig.entry}</code>\n"
+                    f"<b>TP:</b> <code>{sig.tp}</code>\n"
+                    f"<b>SL:</b> <code>{sig.sl}</code>\n"
+                    f"<b>Last price:</b> <code>{price:.5f}</code>\n\n"
+                    f"Теперь можно запросить <b>Новый сигнал</b>.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_kb(),
+                )
+                # Снимаем активный сигнал
+                active_signal_by_user.pop(user_id, None)
+                return
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        # Если API временно упал — просто остановим отслеживание и дадим запросить заново
+        active_signal_by_user.pop(user_id, None)
+        try:
+            await bot.send_message(
+                user_id,
+                "⚠️ Ошибка при отслеживании цены (API). Сигнал сброшен — можешь запросить новый.",
+                reply_markup=main_kb(),
+            )
+        except Exception:
+            pass
+        return
 
 
-# ----------------------------
-# TELEGRAM UI
-# ----------------------------
-def main_kb():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📌 Новый сигнал", callback_data="new_signal")
-    kb.button(text="ℹ️ Помощь", callback_data="help")
-    kb.adjust(2)
-    return kb.as_markup()
+# -------------------- Bot --------------------
 
-
-# ----------------------------
-# BOT
-# ----------------------------
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-)
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
-
-# Background tasks
-_price_task: Optional[asyncio.Task] = None
 
 
 @dp.message(CommandStart())
 async def start(m: Message):
+    # Убираем старые нижние кнопки, если они “прилипли” от прошлого бота
+    await m.answer("✅ Готово. Старые кнопки убраны.", reply_markup=ReplyKeyboardRemove())
     await m.answer(
         "Привет! Я сигнальный бот.\n\n"
-        "Нажми кнопку <b>Новый сигнал</b>, чтобы получить сигнал.\n"
+        "Нажми <b>📌 Новый сигнал</b>, чтобы получить сигнал.\n"
         "Новый сигнал появится только после закрытия предыдущего (TP/SL).",
         reply_markup=main_kb(),
     )
@@ -376,7 +357,7 @@ async def start(m: Message):
 @dp.callback_query(F.data == "help")
 async def cb_help(c: CallbackQuery):
     await c.answer()
-    await c.message.answer(help_text(), reply_markup=main_kb())
+    await c.message.answer(HELP_TEXT, reply_markup=main_kb())
 
 
 @dp.callback_query(F.data == "new_signal")
@@ -384,117 +365,41 @@ async def cb_new_signal(c: CallbackQuery):
     await c.answer()
     user_id = c.from_user.id
 
-    active = get_active_signal(user_id)
-    if active:
+    if user_id in active_signal_by_user:
+        sig = active_signal_by_user[user_id]
         await c.message.answer(
-            "⛔️ У тебя уже есть активный сигнал. Новый появится после закрытия TP/SL.\n\n"
-            + signal_text(active),
+            "⏳ У тебя уже есть активный сигнал.\n"
+            "Новый будет доступен после закрытия текущего (TP/SL).\n\n"
+            f"<b>{sig.symbol}</b> {sig.interval} {sig.direction}\n"
+            f"Entry <code>{sig.entry}</code> | TP <code>{sig.tp}</code> | SL <code>{sig.sl}</code>",
             reply_markup=main_kb(),
         )
         return
 
-    # Получаем свечи и пытаемся построить сигнал
-    async with aiohttp.ClientSession() as session:
-        best = None  # (score, Signal)
-        for sym in SYMBOLS:
-            try:
-                data = await td_time_series(session, sym, TIMEFRAME, CANDLES_LIMIT)
-                closes, highs, lows = parse_candles(data)
-                built = build_signal(sym, closes, highs, lows)
-                if not built:
-                    continue
-                direction, entry, tp, sl, note = built
+    msg = await c.message.answer("🔎 Ищу сигнал…", reply_markup=main_kb())
 
-                # простой "скоринг": чем дальше TP от entry относительно ATR - тем лучше,
-                # но мы уже фиксировали TP/SL. Поэтому просто предпочтём форекс, если оба есть
-                score = 1.0
-                if "EUR" in sym:
-                    score += 0.1
+    sig = await generate_signal()
+    if not sig:
+        await msg.edit_text(
+            "⚠️ Сейчас нет достаточно сильного сигнала по фильтрам.\n"
+            "Попробуй чуть позже.",
+            reply_markup=main_kb(),
+        )
+        return
 
-                sig = Signal(
-                    user_id=user_id,
-                    symbol=sym,
-                    direction=direction,
-                    timeframe=TIMEFRAME.upper(),
-                    entry=float(entry),
-                    tp=float(tp),
-                    sl=float(sl),
-                    note=note,
-                    opened_at=datetime.now(timezone.utc).isoformat(),
-                )
-                if best is None or score > best[0]:
-                    best = (score, sig)
-            except Exception as e:
-                logger.warning("Failed to build signal for %s: %s", sym, e)
+    active_signal_by_user[user_id] = sig
+    await msg.edit_text(format_signal(sig), reply_markup=main_kb())
 
-        if not best:
-            await c.message.answer(
-                "Сейчас нет хорошего сетапа по моим фильтрам. Попробуй через 5–15 минут.",
-                reply_markup=main_kb(),
-            )
-            return
+    # Стартуем отслеживание TP/SL
+    old = watch_task_by_user.get(user_id)
+    if old and not old.done():
+        old.cancel()
 
-        sig = best[1]
-        set_active_signal(sig)
-        await c.message.answer("✅ Сигнал найден. Отслеживаю TP/SL автоматически.\n\n" + signal_text(sig), reply_markup=main_kb())
-
-
-async def price_watcher():
-    """
-    Следит за всеми активными сигналами и закрывает при достижении TP/SL.
-    """
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                actives = list_all_active_signals()
-                if actives:
-                    # группируем по symbol чтобы не дергать цену 100 раз
-                    symbols = sorted(set(s.symbol for s in actives))
-                    prices: Dict[str, Optional[float]] = {}
-                    for sym in symbols:
-                        prices[sym] = await td_price(session, sym)
-
-                    for s in actives:
-                        p = prices.get(s.symbol)
-                        if p is None:
-                            continue
-
-                        hit_tp = (p >= s.tp) if s.direction == "BUY" else (p <= s.tp)
-                        hit_sl = (p <= s.sl) if s.direction == "BUY" else (p >= s.sl)
-
-                        if hit_tp or hit_sl:
-                            result = "🎯 TP достигнут" if hit_tp else "🛑 SL достигнут"
-                            text = (
-                                f"{result}\n\n"
-                                f"<b>{s.symbol}</b> ({s.timeframe})\n"
-                                f"Направление: <b>{s.direction}</b>\n"
-                                f"Текущая цена: <code>{fmt_price(p, s.symbol)}</code>\n"
-                                f"Entry: <code>{fmt_price(s.entry, s.symbol)}</code>\n"
-                                f"TP: <code>{fmt_price(s.tp, s.symbol)}</code>\n"
-                                f"SL: <code>{fmt_price(s.sl, s.symbol)}</code>\n\n"
-                                f"Теперь можно запросить новый сигнал."
-                            )
-                            clear_active_signal(s.user_id)
-                            try:
-                                await bot.send_message(s.user_id, text, reply_markup=main_kb())
-                            except Exception as e:
-                                logger.warning("Failed to notify user %s: %s", s.user_id, e)
-
-            except Exception as e:
-                logger.exception("Watcher loop error: %s", e)
-
-            await asyncio.sleep(PRICE_CHECK_SECONDS)
-
-
-async def on_startup():
-    global _price_task
-    init_db()
-    _price_task = asyncio.create_task(price_watcher())
-    logger.info("Bot started. Watcher running.")
+    task = asyncio.create_task(watch_tp_sl(bot, user_id, sig))
+    watch_task_by_user[user_id] = task
 
 
 async def main():
-    await on_startup()
     await dp.start_polling(bot)
 
 
