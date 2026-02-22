@@ -147,7 +147,8 @@ async def main():
     if ADMIN_ID == 0:
         raise RuntimeError("ADMIN_TG_ID не задан или равен 0")
     await dp.start_polling(bot)
-
+    
 
 if __name__ == "__main__":
     asyncio.run(main())
+
