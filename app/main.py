@@ -1,264 +1,94 @@
 import os
-import math
 import asyncio
-import random
-import sqlite3
-from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any, Tuple
+from dataclasses import dataclass
+from datetime import datetime
 
-import aiohttp
-from aiogram import Bot, Dispatcher
-from aiogram.enums import ParseMode
+import httpx
+import aiosqlite
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.types import Message
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import CommandStart
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    ReplyKeyboardRemove,
-)
+from aiogram.enums import ParseMode
 
-# ==========================
-# ENV
-# ==========================
+
+# ================== ENV ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 TWELVE_API_KEY = os.getenv("TWELVE_API_KEY", "").strip()
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
+    raise RuntimeError("ENV BOT_TOKEN is missing")
 if not TWELVE_API_KEY:
-    raise RuntimeError("TWELVE_API_KEY is missing")
+    raise RuntimeError("ENV TWELVE_API_KEY is missing")
 
-# ==========================
-# CONFIG
-# ==========================
-ALLOWED_SYMBOLS = ["EUR/USD", "XAU/USD"]
-ALLOWED_TIMEFRAMES = ["5min", "15min", "30min"]  # TwelveData interval names
+DB_PATH = "bot.db"
 
-# индикаторы
-EMA_FAST = 9
-EMA_SLOW = 21
-RSI_LEN = 14
-ATR_LEN = 14
+SUPPORTED_SYMBOLS = ["EUR/USD", "XAU/USD"]
+SUPPORTED_TF = ["5min", "15min", "30min"]
+TF_LABELS = {"5min": "5M", "15min": "15M", "30min": "30M"}
 
-# риск/прибыль (в ATR)
-TP_ATR = 1.2
-SL_ATR = 1.0
+CANDLES = 120
+TP_SL_CHECK_EVERY = 30  # секунд
 
-# фильтр силы сигнала
-MIN_EMA_GAP_ATR = 0.15   # разница EMA в долях ATR
-RSI_BUY_MIN = 52
-RSI_BUY_MAX = 68
-RSI_SELL_MIN = 32
-RSI_SELL_MAX = 48
 
-# периодичность трекинга TP/SL
-TRACK_INTERVAL_SEC = 20
+# ================== DATA ==================
+@dataclass
+class Signal:
+    user_id: int
+    symbol: str
+    tf: str
+    direction: str  # BUY/SELL
+    entry: float
+    tp: float
+    sl: float
+    created_at: int
+    is_active: int = 1
 
-DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 
-# ==========================
-# DB
-# ==========================
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ================== INDICATORS ==================
+def ema(values, period: int):
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    ema_val = sum(values[:period]) / period
+    for v in values[period:]:
+        ema_val = v * k + ema_val * (1 - k)
+    return ema_val
 
-def init_db() -> None:
-    conn = db()
-    cur = conn.cursor()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        created_at TEXT NOT NULL
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS signals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        symbol TEXT NOT NULL,
-        tf TEXT NOT NULL,
-        direction TEXT NOT NULL,     -- BUY/SELL
-        entry REAL NOT NULL,
-        tp REAL NOT NULL,
-        sl REAL NOT NULL,
-        atr REAL NOT NULL,
-        ema_fast REAL NOT NULL,
-        ema_slow REAL NOT NULL,
-        rsi REAL NOT NULL,
-        status TEXT NOT NULL,        -- ACTIVE/TP/SL/CANCELLED
-        opened_at TEXT NOT NULL,
-        closed_at TEXT,
-        close_price REAL,
-        FOREIGN KEY(user_id) REFERENCES users(user_id)
-    )
-    """)
-
-    cur.execute("""
-    CREATE INDEX IF NOT EXISTS idx_signals_active
-    ON signals(user_id, status)
-    """)
-
-    conn.commit()
-    conn.close()
-
-def ensure_user(user_id: int) -> None:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    if not row:
-        cur.execute(
-            "INSERT INTO users(user_id, created_at) VALUES(?, ?)",
-            (user_id, datetime.now(timezone.utc).isoformat())
-        )
-        conn.commit()
-    conn.close()
-
-def get_active_signal(user_id: int) -> Optional[sqlite3.Row]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM signals WHERE user_id = ? AND status = 'ACTIVE' ORDER BY id DESC LIMIT 1",
-        (user_id,)
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-def create_signal_row(
-    user_id: int, symbol: str, tf: str, direction: str,
-    entry: float, tp: float, sl: float,
-    atr: float, ema_fast: float, ema_slow: float, rsi: float
-) -> int:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO signals(
-            user_id, symbol, tf, direction, entry, tp, sl,
-            atr, ema_fast, ema_slow, rsi, status, opened_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,'ACTIVE',?)
-    """, (
-        user_id, symbol, tf, direction, entry, tp, sl,
-        atr, ema_fast, ema_slow, rsi,
-        datetime.now(timezone.utc).isoformat()
-    ))
-    conn.commit()
-    signal_id = cur.lastrowid
-    conn.close()
-    return signal_id
-
-def close_signal(signal_id: int, status: str, close_price: float) -> None:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE signals
-        SET status = ?, closed_at = ?, close_price = ?
-        WHERE id = ? AND status = 'ACTIVE'
-    """, (
-        status,
-        datetime.now(timezone.utc).isoformat(),
-        float(close_price),
-        signal_id
-    ))
-    conn.commit()
-    conn.close()
-
-def list_all_active_signals() -> List[sqlite3.Row]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM signals WHERE status = 'ACTIVE'")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-# ==========================
-# TwelveData API
-# ==========================
-async def td_get_json(session: aiohttp.ClientSession, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=25)) as resp:
-        return await resp.json()
-
-async def td_timeseries(session: aiohttp.ClientSession, symbol: str, interval: str, outputsize: int = 120) -> List[Dict[str, Any]]:
-    # https://twelvedata.com/docs#time-series
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "format": "JSON",
-        "apikey": TWELVE_API_KEY,
-    }
-    data = await td_get_json(session, url, params)
-
-    if "status" in data and data["status"] == "error":
-        raise RuntimeError(f"TwelveData error: {data.get('message', 'unknown')}")
-    values = data.get("values")
-    if not values:
-        raise RuntimeError("No candles returned")
-    # values are newest->oldest, we want oldest->newest
-    values.reverse()
-    return values
-
-async def td_quote(session: aiohttp.ClientSession, symbol: str) -> float:
-    # https://twelvedata.com/docs#quote
-    url = "https://api.twelvedata.com/quote"
-    params = {"symbol": symbol, "apikey": TWELVE_API_KEY}
-    data = await td_get_json(session, url, params)
-    if "status" in data and data["status"] == "error":
-        raise RuntimeError(f"TwelveData error: {data.get('message', 'unknown')}")
-    price = data.get("close") or data.get("price")
-    if price is None:
-        raise RuntimeError("No price returned")
-    return float(price)
-
-# ==========================
-# Indicators
-# ==========================
-def ema(values: List[float], length: int) -> float:
-    if len(values) < length:
-        raise ValueError("not enough values for ema")
-    k = 2 / (length + 1)
-    e = values[0]
-    for v in values[1:]:
-        e = v * k + e * (1 - k)
-    return e
-
-def rsi(closes: List[float], length: int) -> float:
-    if len(closes) < length + 1:
-        raise ValueError("not enough values for rsi")
+def rsi(values, period: int = 14):
+    if len(values) < period + 1:
+        return None
     gains = 0.0
     losses = 0.0
-    for i in range(1, length + 1):
-        diff = closes[i] - closes[i - 1]
+    for i in range(1, period + 1):
+        diff = values[i] - values[i - 1]
         if diff >= 0:
             gains += diff
         else:
-            losses += -diff
-    avg_gain = gains / length
-    avg_loss = losses / length if losses > 0 else 1e-12
-    rs = avg_gain / avg_loss
-    out = 100 - (100 / (1 + rs))
-    # Wilder smoothing for the rest
-    for i in range(length + 1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gain = max(diff, 0.0)
-        loss = max(-diff, 0.0)
-        avg_gain = (avg_gain * (length - 1) + gain) / length
-        avg_loss = (avg_loss * (length - 1) + loss) / length if (avg_loss * (length - 1) + loss) > 0 else 1e-12
-        rs = avg_gain / avg_loss
-        out = 100 - (100 / (1 + rs))
-    return float(out)
+            losses += abs(diff)
+    avg_gain = gains / period
+    avg_loss = losses / period
 
-def atr(highs: List[float], lows: List[float], closes: List[float], length: int) -> float:
-    if len(closes) < length + 1:
-        raise ValueError("not enough values for atr")
-    trs: List[float] = []
+    for i in range(period + 1, len(values)):
+        diff = values[i] - values[i - 1]
+        gain = max(diff, 0)
+        loss = max(-diff, 0)
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def atr(highs, lows, closes, period: int = 14):
+    if len(closes) < period + 1:
+        return None
+    trs = []
     for i in range(1, len(closes)):
         tr = max(
             highs[i] - lows[i],
@@ -266,285 +96,350 @@ def atr(highs: List[float], lows: List[float], closes: List[float], length: int)
             abs(lows[i] - closes[i - 1]),
         )
         trs.append(tr)
-    # simple avg first
-    atr_val = sum(trs[:length]) / length
-    # Wilder smoothing
-    for i in range(length, len(trs)):
-        atr_val = (atr_val * (length - 1) + trs[i]) / length
-    return float(atr_val)
+    if len(trs) < period:
+        return None
+    atr_val = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr_val = (atr_val * (period - 1) + tr) / period
+    return atr_val
 
-# ==========================
-# Signal logic
-# ==========================
-def fmt_price(x: float, symbol: str) -> str:
-    # EURUSD -> 5 знаков, XAUUSD -> 2 знака
-    if symbol == "XAU/USD":
-        return f"{x:.2f}"
-    return f"{x:.5f}"
 
-def decide_signal(
-    closes: List[float], highs: List[float], lows: List[float], symbol: str
-) -> Optional[Dict[str, Any]]:
-    # используем последние N точек
-    c = closes[-80:]
-    h = highs[-80:]
-    l = lows[-80:]
-    if len(c) < 30:
+def fmt_price(symbol: str, price: float) -> str:
+    if symbol == "EUR/USD":
+        return f"{price:.5f}"
+    return f"{price:.2f}"
+
+
+# ================== API ==================
+async def fetch_candles(symbol: str, interval: str):
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": str(CANDLES),
+        "apikey": TWELVE_API_KEY,
+        "format": "JSON",
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, params=params)
+        data = r.json()
+
+    if data.get("status") == "error":
+        raise RuntimeError(data.get("message", "TwelveData error"))
+
+    values = data.get("values", [])
+    if not values or len(values) < 30:
         return None
 
-    ema_fast = ema(c, EMA_FAST)
-    ema_slow = ema(c, EMA_SLOW)
-    rsi_v = rsi(c, RSI_LEN)
-    atr_v = atr(h, l, c, ATR_LEN)
+    values = list(reversed(values))  # от старых к новым
+    highs = [float(v["high"]) for v in values]
+    lows = [float(v["low"]) for v in values]
+    closes = [float(v["close"]) for v in values]
+    return highs, lows, closes
 
-    if atr_v <= 0:
+
+async def fetch_quote(symbol: str) -> float | None:
+    url = "https://api.twelvedata.com/quote"
+    params = {"symbol": symbol, "apikey": TWELVE_API_KEY, "format": "JSON"}
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, params=params)
+        data = r.json()
+
+    if data.get("status") == "error":
         return None
 
-    gap = abs(ema_fast - ema_slow)
-    gap_atr = gap / atr_v
+    try:
+        return float(data["price"])
+    except Exception:
+        return None
 
-    last = c[-1]
 
-    # BUY rules
-    if ema_fast > ema_slow and RSI_BUY_MIN <= rsi_v <= RSI_BUY_MAX and gap_atr >= MIN_EMA_GAP_ATR:
-        entry = last
-        tp = entry + atr_v * TP_ATR
-        sl = entry - atr_v * SL_ATR
-        return {
-            "direction": "BUY",
-            "entry": entry,
-            "tp": tp,
-            "sl": sl,
-            "atr": atr_v,
-            "ema_fast": ema_fast,
-            "ema_slow": ema_slow,
-            "rsi": rsi_v,
-        }
+# ================== STRATEGY ==================
+def make_signal(symbol: str, tf: str, highs, lows, closes):
+    ema9 = ema(closes, 9)
+    ema21 = ema(closes, 21)
+    r = rsi(closes, 14)
+    a = atr(highs, lows, closes, 14)
 
-    # SELL rules
-    if ema_fast < ema_slow and RSI_SELL_MIN <= rsi_v <= RSI_SELL_MAX and gap_atr >= MIN_EMA_GAP_ATR:
-        entry = last
-        tp = entry - atr_v * TP_ATR
-        sl = entry + atr_v * SL_ATR
-        return {
-            "direction": "SELL",
-            "entry": entry,
-            "tp": tp,
-            "sl": sl,
-            "atr": atr_v,
-            "ema_fast": ema_fast,
-            "ema_slow": ema_slow,
-            "rsi": rsi_v,
-        }
+    if ema9 is None or ema21 is None or r is None or a is None:
+        return None
 
-    return None
+    last = closes[-1]
 
-async def build_signal(session: aiohttp.ClientSession) -> Optional[Tuple[str, str, Dict[str, Any]]]:
-    # пробуем несколько комбинаций (символ/ТФ), чтобы найти сигнал
-    combos = [(s, tf) for s in ALLOWED_SYMBOLS for tf in ALLOWED_TIMEFRAMES]
-    random.shuffle(combos)
+    # Простой фильтр силы
+    # BUY: EMA9 > EMA21 и RSI >= 55
+    # SELL: EMA9 < EMA21 и RSI <= 45
+    direction = None
+    if ema9 > ema21 and r >= 55:
+        direction = "BUY"
+    elif ema9 < ema21 and r <= 45:
+        direction = "SELL"
+    else:
+        return None
 
-    for symbol, tf in combos:
-        try:
-            candles = await td_timeseries(session, symbol, tf, outputsize=120)
-            closes = [float(x["close"]) for x in candles]
-            highs = [float(x["high"]) for x in candles]
-            lows = [float(x["low"]) for x in candles]
+    # TP/SL от ATR
+    tp_mult = 1.2
+    sl_mult = 0.8
 
-            sig = decide_signal(closes, highs, lows, symbol)
-            if sig:
-                return symbol, tf, sig
-        except Exception:
-            continue
+    entry = last
+    if direction == "BUY":
+        tp = entry + a * tp_mult
+        sl = entry - a * sl_mult
+    else:
+        tp = entry - a * tp_mult
+        sl = entry + a * sl_mult
 
-    return None
+    note = f"EMA9 {'>' if direction=='BUY' else '<'} EMA21 | RSI={r:.1f} | ATR={a:.6f}"
+    return direction, entry, tp, sl, note
 
-# ==========================
-# UI
-# ==========================
-def kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📌 Новый сигнал", callback_data="new_signal")],
-        [InlineKeyboardButton(text="ℹ️ Помощь", callback_data="help")],
-    ])
 
-HELP_TEXT = (
-    "<b>ℹ️ Помощь</b>\n\n"
-    "1) Нажми <b>📌 Новый сигнал</b>, чтобы получить сигнал.\n"
-    "2) Пока есть <b>активный сигнал</b>, новый не выдаётся.\n"
-    "3) Бот автоматически отслеживает <b>TP/SL</b> и сообщит результат.\n\n"
-    "<b>Инструменты:</b> EUR/USD и XAU/USD\n"
-    "<b>Таймфреймы:</b> 5m / 15m / 30m\n\n"
-    "⚠️ <i>Сигналы не являются финансовой рекомендацией.</i>"
-)
+# ================== DB ==================
+async def db_init():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            tf TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            entry REAL NOT NULL,
+            tp REAL NOT NULL,
+            sl REAL NOT NULL,
+            created_at INTEGER NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1
+        )
+        """)
+        await db.commit()
 
-def signal_text(symbol: str, tf: str, sig: Dict[str, Any]) -> str:
-    d = sig["direction"]
-    entry = sig["entry"]
-    tp = sig["tp"]
-    sl = sig["sl"]
-    rsi_v = sig["rsi"]
-    atr_v = sig["atr"]
-    ema_fast = sig["ema_fast"]
-    ema_slow = sig["ema_slow"]
 
-    tf_label = {"5min": "5MIN", "15min": "15MIN", "30min": "30MIN"}.get(tf, tf)
+async def ensure_user(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+        if not await cur.fetchone():
+            await db.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
+            await db.commit()
 
-    return (
-        "✅ <b>Сигнал найден. Отслеживаю TP/SL автоматически.</b>\n\n"
-        f"📈 <b>{symbol} SIGNAL ({tf_label})</b>\n\n"
-        f"<b>Direction:</b> {'🟢 BUY' if d == 'BUY' else '🔴 SELL'}\n"
-        f"<b>Entry:</b> <code>{fmt_price(entry, symbol)}</code>\n"
-        f"<b>Take Profit:</b> <code>{fmt_price(tp, symbol)}</code>\n"
-        f"<b>Stop Loss:</b> <code>{fmt_price(sl, symbol)}</code>\n\n"
-        f"<b>Note:</b> EMA{EMA_FAST}/EMA{EMA_SLOW} | RSI={rsi_v:.1f} | ATR={atr_v:.5f}\n\n"
-        "⚠️ <i>Не является финансовой рекомендацией.</i>"
-    )
 
-def active_signal_text(row: sqlite3.Row) -> str:
-    symbol = row["symbol"]
-    tf = row["tf"]
-    tf_label = {"5min": "5MIN", "15min": "15MIN", "30min": "30MIN"}.get(tf, tf)
-    return (
-        "⏳ <b>У тебя уже есть активный сигнал.</b>\n"
-        "Новый появится после закрытия (TP/SL).\n\n"
-        f"📌 <b>{symbol} ({tf_label})</b>\n"
-        f"<b>Direction:</b> {row['direction']}\n"
-        f"<b>Entry:</b> <code>{fmt_price(float(row['entry']), symbol)}</code>\n"
-        f"<b>TP:</b> <code>{fmt_price(float(row['tp']), symbol)}</code>\n"
-        f"<b>SL:</b> <code>{fmt_price(float(row['sl']), symbol)}</code>\n"
-    )
+async def get_active_signal(user_id: int) -> Signal | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT user_id, symbol, tf, direction, entry, tp, sl, created_at, is_active
+            FROM signals
+            WHERE user_id=? AND is_active=1
+            ORDER BY id DESC
+            LIMIT 1
+        """, (user_id,))
+        row = await cur.fetchone()
+        if not row:
+            return None
+        return Signal(*row)
 
-# ==========================
-# BOT
-# ==========================
+
+async def create_signal(sig: Signal):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO signals (user_id, symbol, tf, direction, entry, tp, sl, created_at, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+        """, (sig.user_id, sig.symbol, sig.tf, sig.direction, sig.entry, sig.tp, sig.sl, sig.created_at))
+        await db.commit()
+
+
+async def close_signal(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE signals SET is_active=0 WHERE user_id=? AND is_active=1", (user_id,))
+        await db.commit()
+
+
+# ================== UI ==================
+def main_kb():
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="📍 Новый сигнал")
+    kb.button(text="ℹ️ Помощь")
+    kb.adjust(2)
+    return kb.as_markup(resize_keyboard=True)
+
+
+# ================== BOT ==================
 bot = Bot(
     token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 dp = Dispatcher()
 
-# ==========================
-# Handlers
-# ==========================
-@dp.message(CommandStart())
-async def start(m: Message):
-    ensure_user(m.from_user.id)
+# один watcher на пользователя
+watch_tasks: dict[int, asyncio.Task] = {}
 
-    # Принудительно убираем старые reply-кнопки (серые снизу)
-    await m.answer("Клавиатура обновлена ✅", reply_markup=ReplyKeyboardRemove())
 
-    await m.answer(
-        "Привет! Я выдаю сигналы по EUR/USD и XAU/USD.\n\n"
-        "• Таймфреймы: 5m / 15m / 30m\n"
-        "• Новый сигнал только после закрытия предыдущего (TP/SL)\n\n"
-        "Нажми кнопку ниже 👇",
-        reply_markup=kb(),
+def signal_text(sig: Signal, note: str | None = None) -> str:
+    emoji = "🟢" if sig.direction == "BUY" else "🔴"
+    return (
+        f"📈 <b>{sig.symbol} SIGNAL</b> <i>({TF_LABELS.get(sig.tf, sig.tf)})</i>\n\n"
+        f"<b>Direction:</b> {emoji} <b>{sig.direction}</b>\n"
+        f"<b>Entry:</b> <code>{fmt_price(sig.symbol, sig.entry)}</code>\n"
+        f"<b>Take Profit:</b> <code>{fmt_price(sig.symbol, sig.tp)}</code>\n"
+        f"<b>Stop Loss:</b> <code>{fmt_price(sig.symbol, sig.sl)}</code>\n"
+        + (f"\n<b>Note:</b> {note}\n" if note else "\n")
+        + "\n⚠️ <i>Не является финансовой рекомендацией.</i>"
     )
 
-@dp.callback_query(lambda c: c.data == "help")
-async def on_help(c: CallbackQuery):
-    await c.answer()
-    await c.message.answer(HELP_TEXT, reply_markup=kb())
 
-@dp.callback_query(lambda c: c.data == "new_signal")
-async def on_new_signal(c: CallbackQuery):
-    await c.answer()
-    user_id = c.from_user.id
-    ensure_user(user_id)
+async def start_watch(user_id: int):
+    if user_id in watch_tasks and not watch_tasks[user_id].done():
+        return
 
-    active = get_active_signal(user_id)
+    async def _loop():
+        while True:
+            sig = await get_active_signal(user_id)
+            if not sig:
+                return
+
+            price = await fetch_quote(sig.symbol)
+            if price is None:
+                await asyncio.sleep(TP_SL_CHECK_EVERY)
+                continue
+
+            hit_tp = False
+            hit_sl = False
+
+            if sig.direction == "BUY":
+                if price >= sig.tp:
+                    hit_tp = True
+                elif price <= sig.sl:
+                    hit_sl = True
+            else:
+                if price <= sig.tp:
+                    hit_tp = True
+                elif price >= sig.sl:
+                    hit_sl = True
+
+            if hit_tp or hit_sl:
+                await close_signal(user_id)
+                if hit_tp:
+                    await bot.send_message(
+                        user_id,
+                        f"✅ <b>TP достигнут!</b>\n"
+                        f"{sig.symbol} {TF_LABELS.get(sig.tf)} {sig.direction}\n"
+                        f"Цена: <code>{fmt_price(sig.symbol, price)}</code>\n\n"
+                        f"Теперь можно нажать <b>📍 Новый сигнал</b>."
+                    )
+                else:
+                    await bot.send_message(
+                        user_id,
+                        f"❌ <b>SL сработал</b>\n"
+                        f"{sig.symbol} {TF_LABELS.get(sig.tf)} {sig.direction}\n"
+                        f"Цена: <code>{fmt_price(sig.symbol, price)}</code>\n\n"
+                        f"Теперь можно нажать <b>📍 Новый сигнал</b>."
+                    )
+                return
+
+            await asyncio.sleep(TP_SL_CHECK_EVERY)
+
+    watch_tasks[user_id] = asyncio.create_task(_loop())
+
+
+@dp.message(Command("start"))
+async def start_cmd(m: Message):
+    await ensure_user(m.from_user.id)
+    await m.answer(
+        "Привет! Я выдаю сигналы по <b>EUR/USD</b> и <b>XAU/USD</b>.\n\n"
+        "Правила:\n"
+        "• Нажми <b>📍 Новый сигнал</b> — получишь сигнал.\n"
+        "• Пока сигнал активен — новый не выдаётся.\n"
+        "• Я сам уведомлю, когда цена достигнет <b>TP</b> или <b>SL</b>.\n",
+        reply_markup=main_kb()
+    )
+    await start_watch(m.from_user.id)
+
+
+@dp.message(F.text == "ℹ️ Помощь")
+async def help_(m: Message):
+    await ensure_user(m.from_user.id)
+    await m.answer(
+        "ℹ️ <b>Как пользоваться ботом</b>\n\n"
+        "1) Нажми <b>📍 Новый сигнал</b>.\n"
+        "2) Бот пришлёт сигнал: направление (BUY/SELL), вход (Entry), цели (TP/SL).\n"
+        "3) После выдачи сигнала бот начинает автоматически следить за ценой.\n"
+        "4) Когда цена достигнет TP или SL — бот отправит уведомление.\n"
+        "5) Пока сигнал активен — новый сигнал не выдаётся.\n\n"
+        "Пары: <b>EUR/USD</b> и <b>XAU/USD</b>.\n"
+        "Таймфреймы: <b>5M / 15M / 30M</b> (бот выбирает лучший из доступных).\n\n"
+        "⚠️ Сигналы не гарантия прибыли."
+    )
+
+
+@dp.message(F.text == "📍 Новый сигнал")
+async def new_signal(m: Message):
+    await ensure_user(m.from_user.id)
+
+    # 1) если активный уже есть — блокируем
+    active = await get_active_signal(m.from_user.id)
     if active:
-        await c.message.answer(active_signal_text(active), reply_markup=kb())
-        return
-
-    await c.message.answer("🔎 Ищу сильный сигнал...", reply_markup=kb())
-
-    async with aiohttp.ClientSession() as session:
-        found = await build_signal(session)
-
-    if not found:
-        await c.message.answer(
-            "Сейчас нет достаточно сильного сигнала. Попробуй позже.",
-            reply_markup=kb(),
+        await m.answer(
+            "⛔️ Уже есть активный сигнал.\n"
+            "Новый появится после TP/SL (я уведомлю автоматически)."
         )
+        await start_watch(m.from_user.id)
         return
 
-    symbol, tf, sig = found
+    # 2) перебираем пары и таймфреймы и берём первый "сильный" сигнал
+    #    (простая логика: если сигнала нет — значит фильтр не прошёл)
+    best = None
+    best_note = None
 
-    # Записываем в БД
-    create_signal_row(
-        user_id=user_id,
+    for symbol in SUPPORTED_SYMBOLS:
+        for tf in SUPPORTED_TF:
+            try:
+                candles = await fetch_candles(symbol, tf)
+                if not candles:
+                    continue
+                highs, lows, closes = candles
+                res = make_signal(symbol, tf, highs, lows, closes)
+                if not res:
+                    continue
+                direction, entry, tp, sl, note = res
+                best = (symbol, tf, direction, entry, tp, sl)
+                best_note = note
+                break
+            except Exception:
+                continue
+        if best:
+            break
+
+    if not best:
+        await m.answer("Сейчас нет достаточно сильного сигнала. Попробуй позже.")
+        return
+
+    symbol, tf, direction, entry, tp, sl = best
+    now_ts = int(datetime.utcnow().timestamp())
+
+    sig = Signal(
+        user_id=m.from_user.id,
         symbol=symbol,
         tf=tf,
-        direction=sig["direction"],
-        entry=float(sig["entry"]),
-        tp=float(sig["tp"]),
-        sl=float(sig["sl"]),
-        atr=float(sig["atr"]),
-        ema_fast=float(sig["ema_fast"]),
-        ema_slow=float(sig["ema_slow"]),
-        rsi=float(sig["rsi"]),
+        direction=direction,
+        entry=float(entry),
+        tp=float(tp),
+        sl=float(sl),
+        created_at=now_ts,
+        is_active=1
     )
+    await create_signal(sig)
 
-    await c.message.answer(signal_text(symbol, tf, sig), reply_markup=kb())
+    await m.answer("✅ Сигнал найден. Я отслеживаю TP/SL и уведомлю автоматически.")
+    await m.answer(signal_text(sig, note=best_note), reply_markup=main_kb())
+    await start_watch(m.from_user.id)
 
-# ==========================
-# Tracker
-# ==========================
-async def tracker_loop():
-    # Постоянно проверяет активные сигналы по TP/SL
-    await asyncio.sleep(3)  # небольшая задержка на старт
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                actives = list_all_active_signals()
-                for row in actives:
-                    signal_id = int(row["id"])
-                    user_id = int(row["user_id"])
-                    symbol = row["symbol"]
-                    direction = row["direction"]
-                    tp = float(row["tp"])
-                    sl = float(row["sl"])
-
-                    try:
-                        price = await td_quote(session, symbol)
-                    except Exception:
-                        continue
-
-                    hit_tp = (price >= tp) if direction == "BUY" else (price <= tp)
-                    hit_sl = (price <= sl) if direction == "BUY" else (price >= sl)
-
-                    if hit_tp:
-                        close_signal(signal_id, "TP", price)
-                        await bot.send_message(
-                            user_id,
-                            f"✅ <b>TP достигнут</b>\n"
-                            f"{symbol} | <code>{fmt_price(price, symbol)}</code>\n\n"
-                            "Теперь можно запросить новый сигнал.",
-                            reply_markup=kb(),
-                        )
-                    elif hit_sl:
-                        close_signal(signal_id, "SL", price)
-                        await bot.send_message(
-                            user_id,
-                            f"❌ <b>SL сработал</b>\n"
-                            f"{symbol} | <code>{fmt_price(price, symbol)}</code>\n\n"
-                            "Теперь можно запросить новый сигнал.",
-                            reply_markup=kb(),
-                        )
-
-            except Exception:
-                # чтобы цикл не падал
-                pass
-
-            await asyncio.sleep(TRACK_INTERVAL_SEC)
 
 async def main():
-    init_db()
-    # запускаем трекер
-    asyncio.create_task(tracker_loop())
+    await db_init()
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
