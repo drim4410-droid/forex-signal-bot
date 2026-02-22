@@ -8,7 +8,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_TG_ID", "0"))
 
-bot = Bot(token=BOT_TOKEN)
+from aiogram.enums import ParseMode
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 # tg_id -> сколько бесплатных сигналов осталось
